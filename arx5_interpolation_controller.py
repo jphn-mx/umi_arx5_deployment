@@ -51,6 +51,18 @@ class ArxInterface:
         )
         self.robot_config = self.arx5_cartesian_controller.get_robot_config()
         self.controller_config = self.arx5_cartesian_controller.get_controller_config()
+
+        # The SDK initializes the arm in damping mode (kp=0, kd=default) so it
+        # can be moved by hand. Without setting the position gains, EEF commands
+        # are solved but never tracked, and the arm appears not to move.
+        self.arx5_cartesian_controller.set_gain(
+            arx5.Gain(
+                self.controller_config.default_kp,
+                self.controller_config.default_kd,
+                self.controller_config.default_gripper_kp,
+                self.controller_config.default_gripper_kd,
+            )
+        )
         self.use_multithreading = USE_MULTITHREADING
         self.robot_type = robot_type
         self.can_id = can_id
