@@ -42,7 +42,7 @@ def clamp_pose_to_envelope(pose, ref_pos, ref_rot, max_pos_offset, max_rot_offse
 
 # %%
 @click.command()
-@click.option('-rh', '--robot_type', default='X5')
+@click.option('-rh', '--robot_type', default='X5_umi')
 @click.option('-gp', '--robot_can', type=str, default='can0')
 @click.option('-f', '--frequency', type=float, default=30)
 def main(robot_type,robot_can,frequency):

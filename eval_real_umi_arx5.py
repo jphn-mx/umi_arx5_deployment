@@ -100,17 +100,17 @@ def clamp_pose_to_envelope(pose, ref_pos, ref_rot, max_pos_offset, max_rot_offse
 @click.option('--match_dataset', '-m', default=None, help='Dataset used to overlay and adjust initial condition')
 @click.option('--match_episode', '-me', default=None, type=int, help='Match specific episode from the match dataset')
 @click.option('--match_camera', '-mc', default=0, type=int)
-@click.option('--camera_reorder', '-cr', default='021')
+@click.option('--camera_reorder', '-cr', default='0')
 @click.option('--vis_camera_idx', default=0, type=int, help="Which RealSense camera to visualize.")
 @click.option('--init_joints', '-j', is_flag=True, default=False, help="Whether to initialize robot joint configuration in the beginning.")
-@click.option('--steps_per_inference', '-si', default=6, type=int, help="Action horizon for inference.")
-@click.option('--max_duration', '-md', default=60, help='Max duration for each epoch in seconds.')
-@click.option('--frequency', '-f', default=10, type=float, help="Control frequency in Hz.")
+@click.option('--steps_per_inference', '-si', default=8, type=int, help="Action horizon for inference.")
+@click.option('--max_duration', '-md', default=600, help='Max duration for each epoch in seconds.')
+@click.option('--frequency', '-f', default=5, type=float, help="Control frequency in Hz.")
 @click.option('--command_latency', '-cl', default=0.01, type=float, help="Latency between receiving SapceMouse command to executing on Robot in Sec.")
 @click.option('-nm', '--no_mirror', is_flag=True, default=False)
 @click.option('-sf', '--sim_fov', type=float, default=None)
 @click.option('-ci', '--camera_intrinsics', type=str, default=None)
-@click.option('-rt', '--robot_type', default='X5')
+@click.option('-rt', '--robot_type', default='X5_umi')
 @click.option('--mirror_crop', is_flag=True, default=False)
 @click.option('--mirror_swap', is_flag=True, default=False)
 
@@ -122,10 +122,10 @@ def main(input, output, robot_ip,
     frequency, command_latency, 
     no_mirror, sim_fov, camera_intrinsics, robot_type, 
     mirror_crop, mirror_swap):
-    max_pos_offset = np.array([0.2, 0.2, 0.2])  # m, per axis in base frame
-    max_rot_offset = np.array([np.deg2rad(60.0) , np.deg2rad(80.0), np.deg2rad(60.0)])  
+    max_pos_offset = np.array([0.3, 0.3, 0.3])  # m, per axis in base frame
+    max_rot_offset = np.array([np.deg2rad(60.0) , np.deg2rad(60.0), np.deg2rad(60.0)])  
     max_gripper_width = 0.08
-    gripper_speed = 0.2
+    gripper_speed = 0.01
 
     # load checkpoint
     ckpt_path = input
@@ -153,8 +153,9 @@ def main(input, output, robot_ip,
         )
 
     print("steps_per_inference:", steps_per_inference)
+    cv2.setNumThreads(1)
     with SharedMemoryManager() as shm_manager:
-        with Spacemouse(shm_manager=shm_manager) as sm, \
+        with Spacemouse(shm_manager=shm_manager,max_value=350) as sm, \
             KeystrokeCounter() as key_counter, \
             UmiArx5Env(
                 output_dir=output, 
@@ -168,6 +169,8 @@ def main(input, output, robot_ip,
                 # latency
                 camera_obs_latency=0.17,
                 robot_obs_latency=0.0001,
+                # Only used when dynamic_latency=False. The policy loop below
+                # uses dynamic_latency=True, so this value is not applied.
                 robot_action_latency=0.18,
                 # camera_obs_latency=0.0,
                 # robot_obs_latency=0.0,
@@ -182,11 +185,11 @@ def main(input, output, robot_ip,
                 mirror_crop=mirror_crop,
                 mirror_swap=mirror_swap,
                 # action
-                max_pos_speed=2.0,
-                max_rot_speed=6.0,
+                max_pos_speed=0.25,
+                max_rot_speed=0.5,
                 robot_type=robot_type,
                 shm_manager=shm_manager) as env:
-            cv2.setNumThreads(2)
+            # cv2.setNumThreads(2)
             print("Waiting for camera")
             time.sleep(1.0)
 
@@ -236,11 +239,19 @@ def main(input, output, robot_ip,
 
             print("Warming up policy inference")
             obs = env.get_obs()
+            # The checkpoint was trained with obs_pose_repr='relative' and
+            # robot0_eef_rot_axis_angle_wrt_start in shape_meta, so the
+            # current episode's reference pose must be provided.
+            episode_start_pose = [np.concatenate([
+                obs['robot0_eef_pos'][-1],
+                obs['robot0_eef_rot_axis_angle'][-1]
+            ])]
             with torch.no_grad():
                 policy.reset()
                 obs_dict_np = get_real_umi_obs_dict(
-                    env_obs=obs, shape_meta=cfg.task.shape_meta, 
-                    obs_pose_repr=obs_pose_rep)
+                    env_obs=obs, shape_meta=cfg.task.shape_meta,
+                    obs_pose_repr=obs_pose_rep,
+                    episode_start_pose=episode_start_pose)
                 obs_dict = dict_apply(obs_dict_np, 
                     lambda x: torch.from_numpy(x).unsqueeze(0).to(device))
                 result = policy.predict_action(obs_dict)
@@ -358,8 +369,8 @@ def main(input, output, robot_ip,
                     # get teleop command
                     sm_state = sm.get_motion_state_transformed()
                     # print(sm_state)
-                    dpos = sm_state[:3] * (0.5 / frequency)
-                    drot_xyz = sm_state[3:] * (1.5 / frequency)
+                    dpos = sm_state[:3] * (0.1 / frequency)
+                    drot_xyz = sm_state[3:] * (0.1 / frequency)
 
                     drot = st.Rotation.from_euler('xyz', drot_xyz)
                     target_pose[:3] += dpos
@@ -398,6 +409,18 @@ def main(input, output, robot_ip,
                     eval_t_start = time.time() + start_delay
                     t_start = time.monotonic() + start_delay
                     env.start_episode(eval_t_start)
+                    # Freeze this episode's reference pose, matching
+                    # robot0_demo_start_pose[0] during training.
+                    obs_start = env.get_obs()
+                    episode_start_pose = [np.concatenate([
+                        obs_start['robot0_eef_pos'][-1],
+                        obs_start['robot0_eef_rot_axis_angle'][-1]
+                    ])]
+                    # Policy is bounded by the same position/rotation
+                    # envelope as human control, centered on the pose at
+                    # episode start.
+                    ref_pos = episode_start_pose[0][:3].copy()
+                    ref_rot = st.Rotation.from_rotvec(episode_start_pose[0][3:])
                     # wait for 1/30 sec to get the closest frame actually
                     # reduces overall latency
                     frame_latency = 1/60
@@ -418,8 +441,9 @@ def main(input, output, robot_ip,
                         with torch.no_grad():
                             s = time.time()
                             obs_dict_np = get_real_umi_obs_dict(
-                                env_obs=obs, shape_meta=cfg.task.shape_meta, 
-                                obs_pose_repr=obs_pose_rep)
+                                env_obs=obs, shape_meta=cfg.task.shape_meta,
+                                obs_pose_repr=obs_pose_rep,
+                                episode_start_pose=episode_start_pose)
                             obs_dict = dict_apply(obs_dict_np, 
                                 lambda x: torch.from_numpy(x).unsqueeze(0).to(device))
                             result = policy.predict_action(obs_dict)
@@ -430,31 +454,25 @@ def main(input, output, robot_ip,
                         # convert policy action to env actions
                         this_target_poses = action
                         # this_target_poses[:,2] = np.maximum(this_target_poses[:,2], 0.055)
+                        # same position/rotation envelope as human control
+                        for i in range(len(this_target_poses)):
+                            this_target_poses[i, :6] = clamp_pose_to_envelope(
+                                this_target_poses[i, :6], ref_pos, ref_rot,
+                                max_pos_offset, max_rot_offset)
 
-                        # deal with timing
-                        # the same step actions are always the target for
+                        # Actions are timestamped from the observation. Send
+                        # the whole chunk; the env drops actions older than
+                        # receive_time, and the controller aligns the rest to
+                        # the trajectory it is already executing.
                         action_timestamps = (np.arange(len(action), dtype=np.float64)
                             ) * dt + obs_timestamps[-1]
-                        action_exec_latency = 0.01
-                        curr_time = time.time()
-                        is_new = action_timestamps > (curr_time + action_exec_latency)
-                        if np.sum(is_new) == 0:
-                            # exceeded time budget, still do something
-                            this_target_poses = this_target_poses[[-1]]
-                            # schedule on next available step
-                            next_step_idx = int(np.ceil((curr_time - eval_t_start) / dt))
-                            action_timestamp = eval_t_start + (next_step_idx) * dt
-                            print('Over budget', action_timestamp - curr_time)
-                            action_timestamps = np.array([action_timestamp])
-                        else:
-                            this_target_poses = this_target_poses[is_new]
-                            action_timestamps = action_timestamps[is_new]
 
                         # execute actions
                         env.exec_actions(
                             actions=this_target_poses,
                             timestamps=action_timestamps,
-                            compensate_latency=True
+                            compensate_latency=False,
+                            dynamic_latency=True
                         )
                         print(f"Submitted {len(this_target_poses)} steps of actions.")
 

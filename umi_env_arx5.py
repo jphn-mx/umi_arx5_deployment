@@ -35,7 +35,7 @@ class UmiArx5Env:
             robot_ip='can0',
             # env params
             frequency=20,
-            robot_type='X5',
+            robot_type='X5_umi',
             # obs
             obs_image_resolution=(224,224),
             max_obs_buffer_size=60,
@@ -62,6 +62,8 @@ class UmiArx5Env:
             max_pos_speed=0.25,
             max_rot_speed=0.6,
             # robot
+            # Only used by the UR5 branch. The X5 branch uses the URDF
+            # eef_link, so robot_type must be X5_umi/L5_umi for the TCP.
             tcp_offset=0.21,
             init_joints=False,
             # vis params
@@ -258,7 +260,9 @@ class UmiArx5Env:
                 shm_manager=shm_manager,
                 robot_type=robot_type,
                 robot_can=robot_ip,
-                frequency=100,
+                frequency=200,
+                max_pos_speed=max_pos_speed,
+                max_rot_speed=max_rot_speed,
                 verbose=False,
                 receive_latency=robot_obs_latency
             )
@@ -434,10 +438,11 @@ class UmiArx5Env:
 
         return obs_data
     
-    def exec_actions(self, 
-            actions: np.ndarray, 
+    def exec_actions(self,
+            actions: np.ndarray,
             timestamps: np.ndarray,
-            compensate_latency=False):
+            compensate_latency=False,
+            dynamic_latency=False):
         assert self.is_ready
         if not isinstance(actions, np.ndarray):
             actions = np.array(actions)
@@ -450,18 +455,30 @@ class UmiArx5Env:
         new_actions = actions[is_new]
         new_timestamps = timestamps[is_new]
 
-        r_latency = self.robot_action_latency if compensate_latency else 0.0
-        g_latency = self.gripper_action_latency if compensate_latency else 0.0
+        if dynamic_latency:
+            # Buffer the whole chunk, then let the controller find the phase
+            # that best matches the trajectory it is already executing. This
+            # avoids dropping the early part of every chunk when the
+            # observation is older than the fixed latency.
+            for i in range(len(new_actions)):
+                self.robot.add_waypoint(
+                    pose=new_actions[i,:6],
+                    gripper_width=new_actions[i,6:],
+                    target_time=new_timestamps[i]
+                )
+            self.robot.update_trajectory()
+        else:
+            r_latency = self.robot_action_latency if compensate_latency else 0.0
 
-        # schedule waypoints
-        for i in range(len(new_actions)):
-            r_actions = new_actions[i,:6]
-            g_actions = new_actions[i,6:]
-            self.robot.schedule_waypoint(
-                pose=r_actions,
-                gripper_width=g_actions,
-                target_time=new_timestamps[i]-r_latency
-            )
+            # schedule waypoints
+            for i in range(len(new_actions)):
+                r_actions = new_actions[i,:6]
+                g_actions = new_actions[i,6:]
+                self.robot.schedule_waypoint(
+                    pose=r_actions,
+                    gripper_width=g_actions,
+                    target_time=new_timestamps[i]-r_latency
+                )
 
         # record actions
         if self.action_accumulator is not None:

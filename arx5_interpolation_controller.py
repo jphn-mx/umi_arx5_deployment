@@ -16,11 +16,25 @@ import torch
 import zerorpc
 import arx5_interface as arx5
 
+# The ARX SDK reports poses in the URDF eef_link frame (x = tool forward).
+# UMI datasets, policies, and everything above this controller use the TCP
+# frame (z = approach direction). The two are related by a constant rotation:
+#     R_tcp = R_ee @ EE_TO_TCP_ROT
+#     R_ee  = R_tcp @ EE_TO_TCP_ROT.T
+# Same matrices as ee2tcp/tcp2ee in the SDK ZMQ client.
+EE_TO_TCP_ROT = np.array([
+    [0.0, 0.0, 1.0],
+    [-1.0, 0.0, 0.0],
+    [0.0, -1.0, 0.0],
+], dtype=np.float64)
+
 # no further use , just remain symbol
 class Command(enum.Enum):
     STOP = 0
     SERVOL = 1
     SCHEDULE_WAYPOINT = 2
+    ADD_WAYPOINT = 4
+    UPDATE_TRAJECTORY = 5
 
 def easeInOutQuad(t):
     t *= 2
@@ -30,8 +44,86 @@ def easeInOutQuad(t):
         t -= 1
         return -(t * (t - 2) - 1) / 2
 
+
+def _apply_dynamic_latency(
+        pose_interp,
+        waypoint_buffer,
+        t_now,
+        matching_dt=0.01,
+        latency_precision=0.02,
+        max_latency=1.2,
+        smoothing_time=0.4,
+        verbose=False):
+    """Align a buffered action chunk to the trajectory being executed.
+
+    Same idea as real-stanford/umi-arx: search for the latency that best
+    matches the shape of the new chunk to the current trajectory, then
+    rebuild the interpolator from that phase. Waypoints before ``t_now`` are
+    replaced with the current trajectory and the first ``smoothing_time``
+    seconds are blended, so stale actions are not executed as jumps.
+
+    The buffered timestamps only need to be increasing; only relative times
+    (``input_times - input_times[0]``) are used, so wall-clock and monotonic
+    domains do not need to match here.
+    """
+    input_poses = np.array(
+        [cmd['target_pose'] for cmd in waypoint_buffer], dtype=np.float64)
+    input_times = np.array(
+        [float(cmd['target_time']) for cmd in waypoint_buffer], dtype=np.float64)
+    input_gripper_pos = np.array(
+        [float(cmd['target_gripper_width'][0]) for cmd in waypoint_buffer],
+        dtype=np.float64)
+
+    # Current executed trajectory, sampled around now.
+    pose_samples = np.zeros((3, 6))
+    pose_samples[0] = pose_interp(t_now - matching_dt)
+    pose_samples[1] = pose_interp(t_now)
+    pose_samples[2] = pose_interp(t_now + matching_dt)
+
+    input_pose_interp = PoseTrajectoryInterpolator(
+        times=input_times - input_times[0],
+        poses=input_poses
+    )
+
+    # Position error matters more than orientation for choosing the phase.
+    error_weights = np.array([1, 1, 1, 0.1, 0.1, 0.1])
+    latencies = np.arange(matching_dt, max_latency, latency_precision)
+    errors = []
+    for latency in latencies:
+        input_pose_samples = np.zeros((3, 6))
+        input_pose_samples[0] = input_pose_interp(latency - matching_dt)
+        input_pose_samples[1] = input_pose_interp(latency)
+        input_pose_samples[2] = input_pose_interp(latency + matching_dt)
+        errors.append(np.sum(
+            np.abs(input_pose_samples - pose_samples) * error_weights))
+    best_latency = float(latencies[np.argmin(errors)])
+
+    new_times = input_times - input_times[0] + t_now - best_latency
+    smoothed_poses = input_poses.copy()
+    for i in range(len(new_times)):
+        if new_times[i] < t_now:
+            smoothed_poses[i] = pose_interp(new_times[i])
+        elif new_times[i] < t_now + smoothing_time:
+            alpha = (new_times[i] - t_now) / smoothing_time
+            smoothed_poses[i] = (
+                (1 - alpha) * pose_interp(new_times[i])
+                + alpha * input_poses[i]
+            )
+
+    if verbose:
+        print(f"[ArxPositionalController] dynamic latency: {best_latency:.3f}s, "
+              f"error: {min(errors):.3f}")
+
+    new_pose_interp = PoseTrajectoryInterpolator(
+        times=new_times, poses=smoothed_poses)
+    extended_gripper_pos = np.zeros_like(input_poses)
+    extended_gripper_pos[:, 0] = input_gripper_pos
+    new_gripper_interp = PoseTrajectoryInterpolator(
+        times=new_times, poses=extended_gripper_pos)
+    return new_pose_interp, new_gripper_interp, best_latency
+
 class ArxInterface:
-    def __init__(self, robot_type='X5', can_id='can0', USE_MULTITHREADING=True, frequency = 100):
+    def __init__(self, robot_type='X5_umi', can_id='can0', USE_MULTITHREADING=True, frequency = 100):
         robot_config = arx5.RobotConfigFactory.get_instance().get_config(robot_type)
         controller_config = arx5.ControllerConfigFactory.get_instance().get_config(
             "cartesian_controller", robot_config.joint_dof
@@ -67,17 +159,34 @@ class ArxInterface:
         self.robot_type = robot_type
         self.can_id = can_id
 
+        if robot_type not in ('X5_umi', 'X5_iphumi', 'L5_umi'):
+            print(
+                f"[ArxInterface] WARNING: robot_type={robot_type!r} does not put "
+                "eef_link at the UMI TCP. TCP positions will be offset by the "
+                "eef_link-to-TCP distance; use X5_umi/L5_umi for UMI data."
+            )
+
         np.set_printoptions(precision=3, suppress=True)
         self.arx5_cartesian_controller.set_log_level(arx5.LogLevel.DEBUG)
 
     def get_ee_pose(self):
-        # SDK: xyz + KDL RPY (radians). UMI: xyz + rotation vector.
+        # SDK: eef_link pose, xyz + KDL RPY (radians).
         # KDL RPY is Rz(yaw) @ Ry(pitch) @ Rx(roll), scipy's lowercase xyz.
-        arx5_ee_pose = np.array(self.arx5_cartesian_controller.get_eef_state().pose_6d().copy())
-        arx5_ee_pose[3:] = st.Rotation.from_euler(
-            'xyz', arx5_ee_pose[3:], degrees=False
-        ).as_rotvec()
-        return arx5_ee_pose
+        # Convert the rotation to the UMI TCP frame (z = approach direction)
+        # so obs/policy/actions above this boundary are all TCP. With
+        # robot_type X5_umi/L5_umi the eef_link origin is the TCP, so the
+        # position is unchanged.
+        pose_6d = np.array(
+            self.arx5_cartesian_controller.get_eef_state().pose_6d().copy()
+        )
+        R_ee = st.Rotation.from_euler(
+            'xyz', pose_6d[3:], degrees=False
+        ).as_matrix()
+        R_tcp = R_ee @ EE_TO_TCP_ROT
+        return np.concatenate([
+            pose_6d[:3],
+            st.Rotation.from_matrix(R_tcp).as_rotvec(),
+        ])
 
     def get_joint_positions(self):
         return np.array(self.arx5_cartesian_controller.get_joint_state().pos().copy())
@@ -89,25 +198,14 @@ class ArxInterface:
         return np.array([self.arx5_cartesian_controller.get_joint_state().gripper_pos], dtype=np.float64)
 
     def move_to_joint_positions(self, positions: np.ndarray, time_to_go: float):
-        cartesian_waypoints = positions
-
-        waypoint_interval_s = time_to_go
-        interpolate_interval_s = 0.1
-        interpolated_waypoints = []
-        for i in range(len(cartesian_waypoints) - 1):
-            start = cartesian_waypoints[i]
-            end = cartesian_waypoints[i + 1]
-
-            num_interpolations = int(waypoint_interval_s / interpolate_interval_s)
-            for j in range(num_interpolations):
-                interpolated_waypoint = start + (end - start) * j / num_interpolations
-                interpolated_waypoints.append(interpolated_waypoint)
-
-        for waypoint in interpolated_waypoints:
-            eef_state = self.arx5_cartesian_controller.get_eef_state()
-            eef_cmd = arx5.EEFState(waypoint, 0.08)
-            eef_cmd.timestamp = eef_state.timestamp + interpolate_interval_s
-            self.arx5_cartesian_controller.set_eef_cmd(eef_cmd)
+        # Arx5CartesianController has no joint-command interface. The old
+        # implementation fed the 6 joint angles into EEFState as if they were
+        # a Cartesian pose, which would command a meaningless motion. Refuse
+        # instead; keep init_joints=False for the UMI eval.
+        raise NotImplementedError(
+            "Joint-space initialization is not supported by the Cartesian "
+            "controller; keep init_joints=False."
+        )
 
     def start_cartesian_impedance(self):
         pass
@@ -121,13 +219,18 @@ class ArxInterface:
         return host_now + lead_time, sdk_now + lead_time
 
     def update_desired_ee_pose(self, pos, gripper_width, sdk_target_time):
-        """Send a UMI rotation-vector pose with an explicit SDK arrival time.
+        """Send a UMI TCP pose (xyz + rotation vector) to the SDK.
 
-        This only converts rotation representation. The SDK eef frame must
-        already coincide with the TCP used by the caller.
+        The SDK expects an eef_link pose (x = tool forward, KDL RPY), so the
+        TCP rotation is converted back to the EE frame here (inverse of
+        get_ee_pose). With robot_type X5_umi/L5_umi the eef_link origin is
+        the TCP, so the position is unchanged.
         """
-        pose_rpy = np.asarray(pos, dtype=np.float64).copy()
-        pose_rpy[3:] = st.Rotation.from_rotvec(pose_rpy[3:]).as_euler(
+        pose = np.asarray(pos, dtype=np.float64)
+        R_tcp = st.Rotation.from_rotvec(pose[3:]).as_matrix()
+        R_ee = R_tcp @ EE_TO_TCP_ROT.T
+        pose_rpy = pose.copy()
+        pose_rpy[3:] = st.Rotation.from_matrix(R_ee).as_euler(
             'xyz', degrees=False
         )
         eef_cmd = arx5.EEFState(pose_rpy, float(gripper_width[0]))
@@ -151,8 +254,8 @@ class ArxInterpolationController(mp.Process):
     this controller need its separate process (due to python GIL)
     """
     def __init__(self,
-        shm_manager: SharedMemoryManager, 
-        robot_type='X5',
+        shm_manager: SharedMemoryManager,
+        robot_type='X5_umi',
         robot_can='can0',
         frequency=1000,
         launch_timeout=3,
@@ -162,7 +265,9 @@ class ArxInterpolationController(mp.Process):
         verbose=False,
         get_max_k=None,
         receive_latency=0.0,
-        command_lead_time=None
+        command_lead_time=None,
+        max_pos_speed=0.25,
+        max_rot_speed=0.16
         ):
         """
         robot_ip: the ip of the middle-layer controller (NUC)
@@ -171,7 +276,11 @@ class ArxInterpolationController(mp.Process):
         Kxd: the scale of velocity gains
         soft_real_time: enables round-robin scheduling and real-time priority
             requires running scripts/rtprio_setup.sh before hand.
+        max_pos_speed: m/s, Cartesian speed limit for scheduled waypoints
+        max_rot_speed: rad/s, rotational speed limit for scheduled waypoints
         """
+        assert 0 < max_pos_speed
+        assert 0 < max_rot_speed
 
         if joints_init is not None:
             joints_init = np.array(joints_init)
@@ -189,6 +298,8 @@ class ArxInterpolationController(mp.Process):
         if not np.isfinite(self.command_lead_time) or self.command_lead_time <= 0:
             raise ValueError("command_lead_time must be finite and positive")
         self.launch_timeout = launch_timeout
+        self.max_pos_speed = max_pos_speed
+        self.max_rot_speed = max_rot_speed
         self.joints_init = joints_init
         self.joints_init_duration = joints_init_duration
         self.soft_real_time = soft_real_time
@@ -311,7 +422,29 @@ class ArxInterpolationController(mp.Process):
             'target_time': target_time
         }
         self.input_queue.put(message)
-    
+
+    def add_waypoint(self, pose, gripper_width, target_time):
+        """Buffer a waypoint for the next update_trajectory() call."""
+        pose = np.array(pose)
+        assert pose.shape == (6,)
+        gripper_width = np.array(gripper_width)
+        assert gripper_width.shape == (1,)
+
+        message = {
+            'cmd': Command.ADD_WAYPOINT.value,
+            'target_pose': pose,
+            'target_gripper_width': gripper_width,
+            'target_time': target_time
+        }
+        self.input_queue.put(message)
+
+    def update_trajectory(self):
+        """Align all buffered waypoints to the current trajectory at once."""
+        message = {
+            'cmd': Command.UPDATE_TRAJECTORY.value
+        }
+        self.input_queue.put(message)
+
     # ========= receive APIs =============
     def get_state(self, k=None, out=None):
         if k is None:
@@ -361,6 +494,9 @@ class ArxInterpolationController(mp.Process):
                 times=[curr_t],
                 poses=[[float(curr_gripper_width[0]),0,0,0,0,0]]
             )
+
+            # waypoints buffered between ADD_WAYPOINT and UPDATE_TRAJECTORY
+            waypoint_buffer = []
 
             # start franka cartesian impedance policy
             robot.start_cartesian_impedance()
@@ -426,6 +562,8 @@ class ArxInterpolationController(mp.Process):
                             pose=target_pose,
                             time=t_insert,
                             curr_time=curr_time,
+                            max_pos_speed=self.max_pos_speed,
+                            max_rot_speed=self.max_rot_speed
                         )
 
                         target_gripper_width= float(command['target_gripper_width'][0])
@@ -447,6 +585,8 @@ class ArxInterpolationController(mp.Process):
                         pose_interp = pose_interp.schedule_waypoint(
                             pose=target_pose,
                             time=target_time,
+                            max_pos_speed=self.max_pos_speed,
+                            max_rot_speed=self.max_rot_speed,
                             curr_time=curr_time,
                             last_waypoint_time=last_waypoint_time
                         )
@@ -459,6 +599,33 @@ class ArxInterpolationController(mp.Process):
                             last_waypoint_time=last_waypoint_time
                         )
                         last_waypoint_time = target_time
+                    elif cmd == Command.ADD_WAYPOINT.value:
+                        if len(waypoint_buffer) > 0:
+                            if (command['target_time']
+                                    <= waypoint_buffer[-1]['target_time']):
+                                if self.verbose:
+                                    print(
+                                        "[ArxPositionalController] Waypoint time "
+                                        f"{command['target_time']:.3f} is not in "
+                                        "the future, skipping")
+                                continue
+                        waypoint_buffer.append(command)
+                    elif cmd == Command.UPDATE_TRAJECTORY.value:
+                        if len(waypoint_buffer) == 0:
+                            if self.verbose:
+                                print(
+                                    "[ArxPositionalController] No new waypoints "
+                                    "to update trajectory")
+                            continue
+                        pose_interp, gripper_interp, _ = (
+                            _apply_dynamic_latency(
+                                pose_interp=pose_interp,
+                                waypoint_buffer=waypoint_buffer,
+                                t_now=t_now,
+                                verbose=self.verbose
+                            )
+                        )
+                        waypoint_buffer = []
                     else:
                         keep_running = False
                         break
